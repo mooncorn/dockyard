@@ -1,0 +1,23 @@
+# Claude AI configuration files - DO NOT IGNORE
+# .claude/ directories contain important project documentation
+# and should be tracked in version control
+
+tmp
+node_modules
+
+# Build artifacts
+bin/
+*.exe
+**/main
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+.env
