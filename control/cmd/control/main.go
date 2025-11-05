@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/mooncorn/dockyard/control/internal/auth"
+	"github.com/mooncorn/dockyard/control/internal/registry"
 	"github.com/mooncorn/dockyard/control/internal/server"
 	"github.com/mooncorn/dockyard/proto/pb"
 	"google.golang.org/grpc"
@@ -41,14 +42,18 @@ func main() {
 		"worker-token-456": "worker-2",
 	})
 
-	// Create and register Dockyard service
-	dockyardServer := server.NewGRPCServer(server.GRPCServerConfig{
-		Authenticator: authenticator,
-	})
+	// Create worker registry
+	workerRegistry := registry.NewWorkerRegistry()
 
 	// Register example observer
 	observer := &LoggingObserver{}
-	dockyardServer.Subscribe(observer)
+	workerRegistry.Subscribe(observer)
+
+	// Create and register Dockyard service
+	dockyardServer := server.NewGRPCServer(server.GRPCServerConfig{
+		Authenticator:  authenticator,
+		WorkerRegistry: workerRegistry,
+	})
 
 	pb.RegisterDockyardServiceServer(grpcServer, dockyardServer)
 
@@ -67,15 +72,16 @@ func main() {
 	<-sigChan
 	log.Printf("Received shutdown signal, stopping server...")
 
-	// Graceful shutdown
+	// Shutdown worker registry first (stops ping loops and closes connections)
+	workerRegistry.Shutdown()
 	grpcServer.GracefulStop()
-	log.Printf("Server stopped")
+	log.Printf("Server stopped gracefully")
 }
 
 // LoggingObserver is an example observer that logs worker status changes
 type LoggingObserver struct{}
 
-func (o *LoggingObserver) OnEvent(event server.StatusChangedEvent) {
+func (o *LoggingObserver) OnEvent(event registry.StatusChangedEvent) {
 	log.Printf("🔄 Worker Status Change: %s (%s -> %s)",
 		event.WorkerID, event.PreviousStatus, event.CurrentStatus)
 }
