@@ -64,13 +64,15 @@ func main() {
 
 	// Register example observer
 	observer := &LoggingObserver{}
-	workerRegistry.Subscribe(observer)
 
 	// Create worker service with dependencies
 	workerService := services.NewWorkerService(services.WorkerServiceConfig{
 		WorkerRegistry: workerRegistry,
 		WorkerRepo:     store.WorkerRepo,
 	})
+
+	statusNotifier := workerService.GetStatusNotifier()
+	statusNotifier.Subscribe(observer)
 
 	// Create gRPC listener
 	grpcAddress := fmt.Sprintf("%s:%s", *host, *grpcPort)

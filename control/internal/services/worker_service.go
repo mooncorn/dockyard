@@ -1,3 +1,31 @@
+// Package services provides business logic layer for worker management.
+//
+// # Worker Status Events
+//
+// Any component can subscribe to worker status events without direct access to the registry.
+// Use the GetStatusNotifier() method to obtain a Subject interface for event subscription.
+//
+// Example usage:
+//
+//	type MyObserver struct{}
+//
+//	func (o *MyObserver) OnEvent(event registry.StatusChangedEvent) {
+//	    log.Printf("Worker %s status changed from %s to %s",
+//	        event.WorkerID, event.PreviousStatus, event.CurrentStatus)
+//	}
+//
+//	// Subscribe to events
+//	notifier := workerService.GetStatusNotifier()
+//	observer := &MyObserver{}
+//	notifier.Subscribe(observer)
+//
+//	// Unsubscribe when done
+//	defer notifier.Unsubscribe(observer)
+//
+// Status events are emitted when:
+//   - A worker registers (offline -> online)
+//   - A worker unregisters (online -> offline)
+//   - A worker times out due to missed pings (online -> offline)
 package services
 
 import (
@@ -5,6 +33,7 @@ import (
 	"fmt"
 
 	"github.com/mooncorn/dockyard/control/internal/db"
+	"github.com/mooncorn/dockyard/control/internal/interfaces"
 	"github.com/mooncorn/dockyard/control/internal/models"
 	"github.com/mooncorn/dockyard/control/internal/registry"
 	pb "github.com/mooncorn/dockyard/proto/pb"
@@ -35,6 +64,10 @@ type WorkerService interface {
 
 	// IsWorkerOnline checks if a worker is currently online
 	IsWorkerOnline(workerID string) bool
+
+	// GetStatusNotifier returns a Subject interface for subscribing to worker status events
+	// This allows any component to observe status changes without direct access to the registry
+	GetStatusNotifier() interfaces.Subject[registry.StatusChangedEvent]
 }
 
 // WorkerServiceConfig holds the dependencies for WorkerService
@@ -185,4 +218,10 @@ func (s *workerService) ListWorkersWithStatus() ([]*models.WorkerWithStatus, err
 // IsWorkerOnline checks if a worker is currently online
 func (s *workerService) IsWorkerOnline(workerID string) bool {
 	return s.workerRegistry.IsWorkerOnline(workerID)
+}
+
+// GetStatusNotifier returns a Subject interface for subscribing to worker status events
+// This allows any component to observe status changes without direct access to the registry
+func (s *workerService) GetStatusNotifier() interfaces.Subject[registry.StatusChangedEvent] {
+	return s.workerRegistry
 }
