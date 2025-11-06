@@ -8,25 +8,25 @@ import (
 	"log"
 
 	"github.com/mooncorn/dockyard/control/internal/auth"
-	"github.com/mooncorn/dockyard/control/internal/registry"
+	"github.com/mooncorn/dockyard/control/internal/services"
 	"github.com/mooncorn/dockyard/proto/pb"
 )
 
 type GRPCServer struct {
 	pb.UnimplementedDockyardServiceServer
-	authenticator  auth.Authenticator
-	workerRegistry registry.WorkerRegistry
+	authenticator auth.Authenticator
+	workerService services.WorkerService
 }
 
 type GRPCServerConfig struct {
-	Authenticator  auth.Authenticator
-	WorkerRegistry registry.WorkerRegistry
+	Authenticator auth.Authenticator
+	WorkerService services.WorkerService
 }
 
 func NewGRPCServer(config GRPCServerConfig) *GRPCServer {
 	return &GRPCServer{
-		authenticator:  config.Authenticator,
-		workerRegistry: config.WorkerRegistry,
+		authenticator: config.Authenticator,
+		workerService: config.WorkerService,
 	}
 }
 
@@ -38,22 +38,22 @@ func (g *GRPCServer) StreamCommunication(stream pb.DockyardService_StreamCommuni
 	}
 
 	// Check if worker is already connected
-	if g.workerRegistry.IsWorkerOnline(workerID) {
+	if g.workerService.IsWorkerOnline(workerID) {
 		log.Printf("Worker %s rejected: already connected", workerID)
 		return fmt.Errorf("worker %s is already connected", workerID)
 	}
 
 	log.Printf("Worker %s connected via communication stream", workerID)
 
-	// Register worker with the registry
-	err = g.workerRegistry.RegisterWorker(workerID, stream)
+	// Register worker with the service
+	err = g.workerService.RegisterWorker(workerID, stream)
 	if err != nil {
 		return fmt.Errorf("failed to register worker: %w", err)
 	}
 
 	// Cleanup on disconnect
 	defer func() {
-		g.workerRegistry.UnregisterWorker(workerID)
+		g.workerService.UnregisterWorker(workerID)
 		log.Printf("Worker %s disconnected from communication stream", workerID)
 	}()
 
@@ -86,7 +86,15 @@ func (g *GRPCServer) StreamCommunication(stream pb.DockyardService_StreamCommuni
 		// Handle different message types
 		switch msg := workerMsg.Message.(type) {
 		case *pb.WorkerMessage_Pong:
-			g.workerRegistry.HandlePongReceived(workerID, msg.Pong)
+			g.workerService.HandlePongReceived(workerID, msg.Pong)
+		case *pb.WorkerMessage_Metadata:
+			// Update worker metadata via service layer (includes validation)
+			err := g.workerService.HandleMetadataUpdate(workerID, msg.Metadata)
+			if err != nil {
+				log.Printf("Failed to update worker %s metadata: %v", workerID, err)
+			} else {
+				log.Printf("Updated metadata for worker %s", workerID)
+			}
 		default:
 			log.Printf("Unknown message type received from agent %s: %T", workerID, msg)
 		}

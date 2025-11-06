@@ -103,10 +103,44 @@ func (c *GRPCClient) Connect() error {
 
 	log.Printf("Connected to gRPC server at %s", c.config.ServerURL)
 
+	// Send worker metadata
+	go c.sendMetadata()
+
 	// Start message handling
 	go c.handleMessages()
 
 	return nil
+}
+
+func (c *GRPCClient) sendMetadata() {
+	// Collect system metadata
+	metadata, err := CollectSystemMetadata()
+	if err != nil {
+		log.Printf("Failed to collect system metadata: %v", err)
+		return
+	}
+
+	// Create metadata message
+	metadataMsg := &pb.WorkerMessage{
+		Message: &pb.WorkerMessage_Metadata{
+			Metadata: metadata,
+		},
+	}
+
+	// Send metadata to server
+	c.mu.RLock()
+	stream := c.stream
+	c.mu.RUnlock()
+
+	if stream != nil {
+		err := stream.Send(metadataMsg)
+		if err != nil {
+			log.Printf("Failed to send metadata: %v", err)
+		} else {
+			log.Printf("Sent metadata: hostname=%s, ip=%s, cpu_cores=%d, ram_mb=%d",
+				metadata.Hostname, metadata.IpAddress, metadata.CpuCores, metadata.RamMb)
+		}
+	}
 }
 
 func (c *GRPCClient) addAuthToContext(ctx context.Context) context.Context {
