@@ -17,25 +17,25 @@ import (
 )
 
 type GRPCClientConfig struct {
-	ServerURL    string
-	Token        string
-	UseTLS       bool
-	Reconnect    bool
+	ServerURL      string
+	Token          string
+	UseTLS         bool
+	Reconnect      bool
 	ReconnectDelay time.Duration
 }
 
 type GRPCClient struct {
-	config     GRPCClientConfig
-	conn       *grpc.ClientConn
-	client     pb.DockyardServiceClient
-	stream     pb.DockyardService_StreamCommunicationClient
-	ctx        context.Context
-	cancel     context.CancelFunc
-	mu         sync.RWMutex
-	connected  bool
+	config    GRPCClientConfig
+	conn      *grpc.ClientConn
+	client    pb.DockyardServiceClient
+	stream    pb.DockyardService_StreamCommunicationClient
+	ctx       context.Context
+	cancel    context.CancelFunc
+	mu        sync.RWMutex
+	connected bool
 
 	// Reconnection management
-	reconnectMu sync.Mutex
+	reconnectMu   sync.Mutex
 	stopReconnect chan struct{}
 }
 
