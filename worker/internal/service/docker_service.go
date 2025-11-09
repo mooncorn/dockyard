@@ -15,6 +15,7 @@ import (
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
+	"github.com/mooncorn/dockyard/proto/pb"
 )
 
 // ContainerInfo represents detailed information about a container
@@ -40,6 +41,7 @@ type PortMapping struct {
 type DockerService interface {
 	// Container lifecycle
 	CreateContainer(ctx context.Context, config ContainerConfig) (string, error)
+	CreateContainerWithJobID(ctx context.Context, config ContainerConfig, jobID string) (string, error)
 	Start(ctx context.Context, containerID string) error
 	Stop(ctx context.Context, containerID string, timeout *int) error
 	Restart(ctx context.Context, containerID string, timeout *int) error
@@ -54,6 +56,8 @@ type DockerService interface {
 	// Resource management
 	GetAssignedPorts(containerID string) []int
 	GetAssignedVolumes(containerID string) []string
+	GetStats(ctx context.Context) ([]*pb.ContainerStats, float64, int64, error)
+	CanCreateContainer(cpuCores float64, memoryMB int64) (bool, error)
 
 	// Cleanup
 	Close() error
@@ -109,10 +113,13 @@ type dockerService struct {
 	assignedVolumes map[string][]string // containerID -> volume paths
 	availablePorts  []int
 	portInUse       map[int]bool
+	containerJobMap map[string]string   // containerID -> jobID
+	statsCollector  StatsCollector
+	budget          *ResourceBudget
 }
 
 // NewDockerService creates a new Docker service instance
-func NewDockerService(config DockerServiceConfig) (DockerService, error) {
+func NewDockerService(config DockerServiceConfig, budget *ResourceBudget) (DockerService, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Docker client: %w", err)
@@ -130,6 +137,7 @@ func NewDockerService(config DockerServiceConfig) (DockerService, error) {
 	portInUse := make(map[int]bool)
 	assignedPorts := make(map[string][]int)
 	assignedVolumes := make(map[string][]string)
+	containerJobMap := make(map[string]string)
 
 	// Detect ports already in use by existing containers
 	ctx := context.Background()
@@ -184,14 +192,21 @@ func NewDockerService(config DockerServiceConfig) (DockerService, error) {
 		}
 	}
 
-	return &dockerService{
+	service := &dockerService{
 		client:          cli,
 		config:          config,
 		assignedPorts:   assignedPorts,
 		assignedVolumes: assignedVolumes,
 		availablePorts:  availablePorts,
 		portInUse:       portInUse,
-	}, nil
+		containerJobMap: containerJobMap,
+		budget:          budget,
+	}
+
+	// Initialize stats collector with the container job map
+	service.statsCollector = NewStatsCollector(cli, containerJobMap)
+
+	return service, nil
 }
 
 // CreateContainer creates a new Docker container with the specified configuration
@@ -494,6 +509,45 @@ func (d *dockerService) Close() error {
 		return d.client.Close()
 	}
 	return nil
+}
+
+// CreateContainerWithJobID creates a container and associates it with a job ID
+func (d *dockerService) CreateContainerWithJobID(ctx context.Context, config ContainerConfig, jobID string) (string, error) {
+	// Create the container using existing method
+	containerID, err := d.CreateContainer(ctx, config)
+	if err != nil {
+		return "", err
+	}
+
+	// Associate container with job ID
+	d.mu.Lock()
+	d.containerJobMap[containerID] = jobID
+	d.mu.Unlock()
+
+	return containerID, nil
+}
+
+// GetStats collects statistics for all containers
+func (d *dockerService) GetStats(ctx context.Context) ([]*pb.ContainerStats, float64, int64, error) {
+	return d.statsCollector.CollectStats(ctx)
+}
+
+// CanCreateContainer checks if a container with the requested resources can be created
+// based on the current resource usage and budget
+func (d *dockerService) CanCreateContainer(cpuCores float64, memoryMB int64) (bool, error) {
+	if d.budget == nil {
+		return false, fmt.Errorf("resource budget not configured")
+	}
+
+	// Get current resource usage
+	ctx := context.Background()
+	_, usedCPU, usedMemory, err := d.statsCollector.CollectStats(ctx)
+	if err != nil {
+		return false, fmt.Errorf("failed to collect current stats: %w", err)
+	}
+
+	// Check if we can allocate the requested resources
+	return d.budget.CanAllocate(cpuCores, memoryMB, usedCPU, usedMemory), nil
 }
 
 // Helper methods

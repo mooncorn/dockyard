@@ -12,6 +12,9 @@ service DockyardService {
 message ControlMessage {
   oneof message {
     Ping ping = 1;
+    JobRequest job_request = 2;
+    StartContainerTask start_container = 3;
+    StopContainerTask stop_container = 4;
   }
 }
 
@@ -20,6 +23,7 @@ message WorkerMessage {
   oneof message {
     Pong pong = 1;
     WorkerMetadata metadata = 2;
+    JobResponse job_response = 3;
   }
 }
 
@@ -39,4 +43,51 @@ message Ping {
 message Pong {
   int64 timestamp = 1;
   int64 ping_timestamp = 2;
+  repeated ContainerStats containers = 3;
+  double used_cpu_cores = 4;
+  int64 used_memory_mb = 5;
+}
+
+// Container statistics
+message ContainerStats {
+  string container_id = 1;
+  string job_id = 2;
+  string name = 3;
+  string state = 4;
+  double cpu_usage_cores = 5;
+  int64 memory_usage_mb = 6;
+}
+
+// Job-related messages (persistent tasks)
+message JobRequest {
+  oneof payload {
+    CreateContainerJob create_container = 1;
+  }
+}
+
+message CreateContainerJob {
+  string job_id = 1;
+  string image = 2;
+  repeated string env = 3;
+  repeated int32 container_ports = 4;
+  repeated string volume_targets = 5;
+  int64 memory_mb = 6;
+  double cpu_cores = 7;
+}
+
+message JobResponse {
+  string job_id = 1;
+  bool success = 2;
+  string error_message = 3;
+  string container_id = 4;
+}
+
+// Simple task messages (non-persistent)
+message StartContainerTask {
+  string container_id = 1;
+}
+
+message StopContainerTask {
+  string container_id = 1;
+  int32 timeout_seconds = 2;
 }
