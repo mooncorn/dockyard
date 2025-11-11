@@ -1,127 +1,98 @@
-// Package services provides business logic layer for worker management.
-//
-// # Worker Status Events
-//
-// Any component can subscribe to worker status events without direct access to the registry.
-// Use the GetStatusNotifier() method to obtain a Subject interface for event subscription.
-//
-// Example usage:
-//
-//	type MyObserver struct{}
-//
-//	func (o *MyObserver) OnEvent(event registry.StatusChangedEvent) {
-//	    log.Printf("Worker %s status changed from %s to %s",
-//	        event.WorkerID, event.PreviousStatus, event.CurrentStatus)
-//	}
-//
-//	// Subscribe to events
-//	notifier := workerService.GetStatusNotifier()
-//	observer := &MyObserver{}
-//	notifier.Subscribe(observer)
-//
-//	// Unsubscribe when done
-//	defer notifier.Unsubscribe(observer)
-//
-// Status events are emitted when:
-//   - A worker registers (offline -> online)
-//   - A worker unregisters (online -> offline)
-//   - A worker times out due to missed pings (online -> offline)
 package services
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/mooncorn/dockyard/control/internal/db"
-	"github.com/mooncorn/dockyard/control/internal/interfaces"
 	"github.com/mooncorn/dockyard/control/internal/models"
-	"github.com/mooncorn/dockyard/control/internal/registry"
+	"github.com/mooncorn/dockyard/control/internal/worker"
 	pb "github.com/mooncorn/dockyard/proto/pb"
 )
 
-// WorkerService defines the interface for worker-related business logic
-type WorkerService interface {
-	// CreateWorker validates and creates a new worker
-	CreateWorker(worker *models.Worker) error
-
-	// RegisterWorker registers a worker connection with the given stream
-	RegisterWorker(workerID string, stream pb.DockyardService_StreamCommunicationServer) error
-
-	// UnregisterWorker removes a worker connection
-	UnregisterWorker(workerID string)
-
-	// HandlePongReceived processes a pong message from a worker
-	HandlePongReceived(workerID string, pong *pb.Pong)
-
-	// HandleMetadataUpdate validates and updates worker metadata
-	HandleMetadataUpdate(workerID string, metadata *pb.WorkerMetadata) error
-
-	// GetWorkerWithStatus retrieves a worker with its current status
-	GetWorkerWithStatus(workerID string) (*models.WorkerWithStatus, error)
-
-	// ListWorkersWithStatus retrieves all workers with their current status
-	ListWorkersWithStatus() ([]*models.WorkerWithStatus, error)
-
-	// IsWorkerOnline checks if a worker is currently online
-	IsWorkerOnline(workerID string) bool
-
-	// GetStatusNotifier returns a Subject interface for subscribing to worker status events
-	// This allows any component to observe status changes without direct access to the registry
-	GetStatusNotifier() interfaces.Subject[registry.StatusChangedEvent]
-}
-
 // WorkerServiceConfig holds the dependencies for WorkerService
 type WorkerServiceConfig struct {
-	WorkerRegistry registry.WorkerRegistry
+	WorkerRegistry *worker.Registry
 	WorkerRepo     db.WorkerRepository
+	Pinger         *worker.Pinger
 }
 
-// workerService implements the WorkerService interface
-type workerService struct {
-	workerRegistry registry.WorkerRegistry
+// WorkerService implements the WorkerService interface
+type WorkerService struct {
+	workerRegistry *worker.Registry
 	workerRepo     db.WorkerRepository
+	pinger         *worker.Pinger
 }
 
 // NewWorkerService creates a new WorkerService instance
-func NewWorkerService(config WorkerServiceConfig) WorkerService {
-	return &workerService{
+func NewWorkerService(config WorkerServiceConfig) *WorkerService {
+	return &WorkerService{
 		workerRegistry: config.WorkerRegistry,
 		workerRepo:     config.WorkerRepo,
+		pinger:         config.Pinger,
 	}
 }
 
-// CreateWorker validates and creates a new worker
-func (s *workerService) CreateWorker(worker *models.Worker) error {
-	// Validate required fields
-	if worker.ID == "" {
-		return errors.New("worker ID cannot be empty")
+func (s *WorkerService) CreateWorker() (*models.Worker, error) {
+	// Generate worker ID (UUID v4)
+	workerID := uuid.New().String()
+
+	// Generate cryptographically secure random token (32 bytes = 64 hex characters)
+	tokenBytes := make([]byte, 32)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return nil, fmt.Errorf("failed to generate token: %v", err)
 	}
 
-	if worker.Token == "" {
-		return errors.New("worker token cannot be empty")
+	token := hex.EncodeToString(tokenBytes)
+
+	worker := &models.Worker{
+		ID:        workerID,
+		Hostname:  "unknown",
+		IPAddress: "0.0.0.0",
+		CPUCores:  0,
+		RAMMB:     0,
+		Token:     token,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
 	}
 
 	// Create worker in database
-	return s.workerRepo.CreateWorker(worker)
+	if err := s.workerRepo.CreateWorker(worker); err != nil {
+		return nil, fmt.Errorf("failed to create worker: %v", err)
+	}
+
+	return worker, nil
 }
 
-// RegisterWorker registers a worker connection with the given stream
-func (s *workerService) RegisterWorker(workerID string, stream pb.DockyardService_StreamCommunicationServer) error {
-	return s.workerRegistry.RegisterWorker(workerID, stream)
+func (s *WorkerService) ConnectWorker(token string, stream pb.DockyardService_StreamCommunicationServer) (string, error) {
+	// Authenticate worker
+	worker, err := s.workerRepo.GetWorkerByToken(token)
+	if err != nil {
+		return "", fmt.Errorf("invalid credentials")
+	}
+
+	// Don't override an existing connection with the same token
+	if s.workerRegistry.IsOnline(worker.ID) {
+		return "", fmt.Errorf("worker %s is already connected", worker.ID)
+	}
+
+	// Register worker with the registry
+	if err := s.workerRegistry.Register(worker.ID, stream); err != nil {
+		return "", fmt.Errorf("failed to register worker with the registry: %s", worker.ID)
+	}
+
+	return worker.ID, nil
 }
 
-// UnregisterWorker removes a worker connection
-func (s *workerService) UnregisterWorker(workerID string) {
-	s.workerRegistry.UnregisterWorker(workerID)
+func (s *WorkerService) DisconnectWorker(workerID string) {
+	s.workerRegistry.Unregister(workerID)
 }
 
-// HandlePongReceived processes a pong message from a worker
-func (s *workerService) HandlePongReceived(workerID string, pong *pb.Pong) {
-	s.workerRegistry.HandlePongReceived(workerID, pong)
-}
-
-// HandleMetadataUpdate validates and updates worker metadata
-func (s *workerService) HandleMetadataUpdate(workerID string, metadata *pb.WorkerMetadata) error {
+func (s *WorkerService) HandleMetadataUpdate(workerID string, metadata *pb.WorkerMetadata) error {
 	// Validate business rules
 	if metadata.Hostname == "" {
 		return errors.New("hostname cannot be empty")
@@ -146,82 +117,11 @@ func (s *workerService) HandleMetadataUpdate(workerID string, metadata *pb.Worke
 		workerID,
 		metadata.Hostname,
 		metadata.IpAddress,
-		int(metadata.CpuCores),
-		int(metadata.RamMb),
+		metadata.CpuCores,
+		metadata.RamMb,
 	)
 }
 
-// GetWorkerWithStatus retrieves a worker with its current status
-func (s *workerService) GetWorkerWithStatus(workerID string) (*models.WorkerWithStatus, error) {
-	// Fetch worker from database
-	worker, err := s.workerRepo.GetWorkerByID(workerID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get worker: %w", err)
-	}
-
-	// Get in-memory connection status from registry
-	connection, isConnected := s.workerRegistry.GetWorker(workerID)
-
-	// Create WorkerWithStatus combining both sources
-	workerWithStatus := &models.WorkerWithStatus{
-		ID:        worker.ID,
-		Hostname:  worker.Hostname,
-		IPAddress: worker.IPAddress,
-		CPUCores:  worker.CPUCores,
-		RAMMB:     worker.RAMMB,
-		CreatedAt: worker.CreatedAt,
-		UpdatedAt: worker.UpdatedAt,
-		Status:    "offline", // Default to offline
-	}
-
-	// If worker is connected and online, add real-time status and health metrics
-	if isConnected && connection.Status == registry.WorkerStatusOnline {
-		workerWithStatus.Status = "online"
-		workerWithStatus.LastPingTime = &connection.LastPingTime
-		workerWithStatus.PendingPingCount = &connection.PendingPingCount
-	}
-
-	return workerWithStatus, nil
-}
-
-// ListWorkersWithStatus retrieves all workers with their current status
-func (s *workerService) ListWorkersWithStatus() ([]*models.WorkerWithStatus, error) {
-	// Get all workers from database
-	workers, err := s.workerRepo.GetAllWorkers()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get workers: %w", err)
-	}
-
-	// Combine with status from registry
-	workersWithStatus := make([]*models.WorkerWithStatus, 0, len(workers))
-	for _, worker := range workers {
-		status := "offline"
-		if s.workerRegistry.IsWorkerOnline(worker.ID) {
-			status = "online"
-		}
-
-		workersWithStatus = append(workersWithStatus, &models.WorkerWithStatus{
-			ID:        worker.ID,
-			Hostname:  worker.Hostname,
-			IPAddress: worker.IPAddress,
-			CPUCores:  worker.CPUCores,
-			RAMMB:     worker.RAMMB,
-			CreatedAt: worker.CreatedAt,
-			UpdatedAt: worker.UpdatedAt,
-			Status:    status,
-		})
-	}
-
-	return workersWithStatus, nil
-}
-
-// IsWorkerOnline checks if a worker is currently online
-func (s *workerService) IsWorkerOnline(workerID string) bool {
-	return s.workerRegistry.IsWorkerOnline(workerID)
-}
-
-// GetStatusNotifier returns a Subject interface for subscribing to worker status events
-// This allows any component to observe status changes without direct access to the registry
-func (s *workerService) GetStatusNotifier() interfaces.Subject[registry.StatusChangedEvent] {
-	return s.workerRegistry
+func (s *WorkerService) HandlePongReceived(workerID string, pong *pb.Pong) {
+	s.pinger.HandlePongReceived(workerID, pong)
 }

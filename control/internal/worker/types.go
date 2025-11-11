@@ -1,4 +1,4 @@
-package registry
+package worker
 
 import (
 	"context"
@@ -8,11 +8,11 @@ import (
 )
 
 // WorkerStatus represents the current status of a worker
-type WorkerStatus string
+type Status string
 
 const (
-	WorkerStatusOnline  WorkerStatus = "online"
-	WorkerStatusOffline WorkerStatus = "offline"
+	StatusOnline  Status = "online"
+	StatusOffline Status = "offline"
 )
 
 // Health monitoring constants
@@ -30,11 +30,15 @@ type StatusChangedEvent struct {
 }
 
 // WorkerConnection represents a connected worker
-type WorkerConnection struct {
-	ID               string
-	Stream           pb.DockyardService_StreamCommunicationServer
-	Status           WorkerStatus
-	LastPingTime     time.Time
-	PendingPingCount int
-	CancelPing       context.CancelFunc
+type Connection struct {
+	ID     string
+	Stream pb.DockyardService_StreamCommunicationServer
+	Status Status
+
+	UsedCpuCores float64
+	UsedMemoryMb int64
+	Containers   []*pb.ContainerStats
+
+	sendCh       chan *pb.ControlMessage // Channel for sending messages (managed by ConnectionStore)
+	cancelSender context.CancelFunc      // Cancel function for sender goroutine
 }

@@ -25,12 +25,16 @@ type DockerService interface {
 }
 
 type GRPCClientConfig struct {
-	ServerURL      string
-	Token          string
-	UseTLS         bool
-	Reconnect      bool
-	ReconnectDelay time.Duration
-	DockerService  DockerService
+	ServerURL         string
+	Token             string
+	UseTLS            bool
+	Reconnect         bool
+	ReconnectDelay    time.Duration
+	MaxConnectRetries int           // 0 = infinite retries on initial connection
+	InitialRetryDelay time.Duration // Initial delay for retry backoff (default: 1s)
+	MaxRetryDelay     time.Duration // Maximum delay for retry backoff (default: 60s)
+	DockerService     DockerService
+	Budget            *service.ResourceBudget
 }
 
 type GRPCClient struct {
@@ -55,6 +59,16 @@ func NewGRPCClient(config GRPCClientConfig) *GRPCClient {
 		config.ReconnectDelay = 5 * time.Second
 	}
 
+	// Set default initial retry delay if not specified
+	if config.InitialRetryDelay == 0 {
+		config.InitialRetryDelay = 1 * time.Second
+	}
+
+	// Set default max retry delay if not specified
+	if config.MaxRetryDelay == 0 {
+		config.MaxRetryDelay = 60 * time.Second
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &GRPCClient{
@@ -66,7 +80,67 @@ func NewGRPCClient(config GRPCClientConfig) *GRPCClient {
 	}
 }
 
+// Connect establishes a connection to the gRPC server with automatic retry and exponential backoff
 func (c *GRPCClient) Connect() error {
+	maxRetries := c.config.MaxConnectRetries
+	retryDelay := c.config.InitialRetryDelay
+	attempt := 0
+
+	for {
+		attempt++
+
+		// Check if context is cancelled before attempting connection
+		if c.ctx.Err() != nil {
+			return fmt.Errorf("context cancelled before connection attempt")
+		}
+
+		// Attempt to connect
+		err := c.attemptConnect()
+		if err == nil {
+			// Successfully connected
+			if attempt > 1 {
+				log.Printf("Successfully connected after %d attempts", attempt)
+			}
+			return nil
+		}
+
+		// Connection failed
+		if attempt == 1 {
+			log.Printf("Initial connection attempt failed: %v", err)
+		} else {
+			log.Printf("Connection attempt %d failed: %v", attempt, err)
+		}
+
+		// Check if we should retry
+		if maxRetries > 0 && attempt >= maxRetries {
+			return fmt.Errorf("failed to connect after %d attempts: %w", maxRetries, err)
+		}
+
+		// Log retry information
+		if maxRetries == 0 {
+			log.Printf("Retrying in %v... (attempt %d, infinite retries)", retryDelay, attempt)
+		} else {
+			log.Printf("Retrying in %v... (attempt %d/%d)", retryDelay, attempt, maxRetries)
+		}
+
+		// Wait before retrying
+		select {
+		case <-time.After(retryDelay):
+			// Continue to next attempt
+		case <-c.ctx.Done():
+			return fmt.Errorf("context cancelled during retry wait")
+		}
+
+		// Apply exponential backoff
+		retryDelay *= 2
+		if retryDelay > c.config.MaxRetryDelay {
+			retryDelay = c.config.MaxRetryDelay
+		}
+	}
+}
+
+// attemptConnect performs a single connection attempt to the gRPC server
+func (c *GRPCClient) attemptConnect() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -124,8 +198,8 @@ func (c *GRPCClient) Connect() error {
 }
 
 func (c *GRPCClient) sendMetadata() {
-	// Collect system metadata
-	metadata, err := CollectSystemMetadata()
+	// Collect system metadata using the resource budget
+	metadata, err := CollectSystemMetadata(c.config.Budget)
 	if err != nil {
 		log.Printf("Failed to collect system metadata: %v", err)
 		return
@@ -148,7 +222,7 @@ func (c *GRPCClient) sendMetadata() {
 		if err != nil {
 			log.Printf("Failed to send metadata: %v", err)
 		} else {
-			log.Printf("Sent metadata: hostname=%s, ip=%s, cpu_cores=%d, ram_mb=%d",
+			log.Printf("Sent metadata: hostname=%s, ip=%s, cpu_cores=%.2f, ram_mb=%d",
 				metadata.Hostname, metadata.IpAddress, metadata.CpuCores, metadata.RamMb)
 		}
 	}
@@ -444,10 +518,13 @@ func (c *GRPCClient) reconnectLoop() {
 
 	log.Printf("Starting reconnection loop...")
 
-	ticker := time.NewTicker(c.config.ReconnectDelay)
-	defer ticker.Stop()
+	retryDelay := c.config.ReconnectDelay
+	attempt := 0
 
 	for {
+		attempt++
+
+		// Wait before attempting reconnection
 		select {
 		case <-c.stopReconnect:
 			log.Printf("Reconnection loop stopped")
@@ -455,29 +532,38 @@ func (c *GRPCClient) reconnectLoop() {
 		case <-c.ctx.Done():
 			log.Printf("Client context cancelled, stopping reconnection")
 			return
-		case <-ticker.C:
-			c.mu.RLock()
-			connected := c.connected
-			c.mu.RUnlock()
+		case <-time.After(retryDelay):
+			// Continue to reconnection attempt
+		}
 
-			if !connected {
-				log.Printf("Attempting to reconnect...")
+		c.mu.RLock()
+		connected := c.connected
+		c.mu.RUnlock()
 
-				// Close existing connection if any
-				c.closeConnection()
+		if !connected {
+			log.Printf("Attempting to reconnect (attempt %d)...", attempt)
 
-				// Try to reconnect
-				err := c.Connect()
-				if err != nil {
-					log.Printf("Reconnection failed: %v", err)
-				} else {
-					log.Printf("Successfully reconnected")
-					return // Exit reconnection loop
+			// Close existing connection if any
+			c.closeConnection()
+
+			// Try to reconnect using attemptConnect directly to avoid nested retry logic
+			err := c.attemptConnect()
+			if err != nil {
+				log.Printf("Reconnection attempt %d failed: %v", attempt, err)
+
+				// Apply exponential backoff for next attempt
+				retryDelay *= 2
+				if retryDelay > c.config.MaxRetryDelay {
+					retryDelay = c.config.MaxRetryDelay
 				}
+				log.Printf("Will retry in %v...", retryDelay)
 			} else {
-				log.Printf("Already connected, stopping reconnection loop")
-				return
+				log.Printf("Successfully reconnected after %d attempts", attempt)
+				return // Exit reconnection loop
 			}
+		} else {
+			log.Printf("Already connected, stopping reconnection loop")
+			return
 		}
 	}
 }

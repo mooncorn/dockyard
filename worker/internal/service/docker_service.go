@@ -512,19 +512,118 @@ func (d *dockerService) Close() error {
 }
 
 // CreateContainerWithJobID creates a container and associates it with a job ID
+// This method is idempotent - if a container with the same job_id already exists, it returns that container's ID
 func (d *dockerService) CreateContainerWithJobID(ctx context.Context, config ContainerConfig, jobID string) (string, error) {
-	// Create the container using existing method
-	containerID, err := d.CreateContainer(ctx, config)
+	// Check if a container with this job_id already exists
+	filter := filters.NewArgs()
+	filter.Add("label", fmt.Sprintf("dockyard.job_id=%s", jobID))
+
+	existingContainers, err := d.client.ContainerList(ctx, container.ListOptions{
+		All:     true, // Include stopped containers
+		Filters: filter,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to check for existing container: %w", err)
+	}
+
+	// If container already exists, return its ID (idempotent behavior)
+	if len(existingContainers) > 0 {
+		existingID := existingContainers[0].ID
+
+		// Update the in-memory containerJobMap if not already present
+		d.mu.Lock()
+		if _, exists := d.containerJobMap[existingID]; !exists {
+			d.containerJobMap[existingID] = jobID
+		}
+		d.mu.Unlock()
+
+		return existingID, nil
+	}
+
+	// Container doesn't exist, create it with job_id label
+	containerID, err := d.createContainerWithLabel(ctx, config, jobID)
 	if err != nil {
 		return "", err
 	}
 
-	// Associate container with job ID
+	// Associate container with job ID in memory
 	d.mu.Lock()
 	d.containerJobMap[containerID] = jobID
 	d.mu.Unlock()
 
 	return containerID, nil
+}
+
+// createContainerWithLabel is similar to CreateContainer but adds job_id as a Docker label
+func (d *dockerService) createContainerWithLabel(ctx context.Context, config ContainerConfig, jobID string) (string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Pull image if not exists
+	if err := d.pullImageIfNotExists(ctx, config.Image); err != nil {
+		return "", fmt.Errorf("failed to ensure image: %w", err)
+	}
+
+	// Prepare port bindings
+	portBindings, exposedPorts, assignedPorts, err := d.preparePorts(config.Ports)
+	if err != nil {
+		return "", fmt.Errorf("failed to prepare ports: %w", err)
+	}
+
+	// Prepare volumes
+	mounts, volumePaths, err := d.prepareVolumes(config.Volumes)
+	if err != nil {
+		// Cleanup allocated ports on failure
+		for _, port := range assignedPorts {
+			d.portInUse[port] = false
+		}
+		return "", fmt.Errorf("failed to prepare volumes: %w", err)
+	}
+
+	// Prepare restart policy
+	restartPolicy := d.getRestartPolicy(config.RestartPolicy)
+
+	// Create container configuration with job_id label
+	containerConfig := &container.Config{
+		Image:        config.Image,
+		Cmd:          config.Cmd,
+		Env:          config.Env,
+		ExposedPorts: exposedPorts,
+		Labels: map[string]string{
+			"dockyard.job_id": jobID,
+		},
+	}
+
+	hostConfig := &container.HostConfig{
+		PortBindings:  portBindings,
+		Mounts:        mounts,
+		RestartPolicy: restartPolicy,
+	}
+
+	// Set resource limits
+	if config.CPULimit > 0 {
+		hostConfig.Resources.NanoCPUs = config.CPULimit
+	}
+	if config.MemoryLimit > 0 {
+		hostConfig.Resources.Memory = config.MemoryLimit
+	}
+
+	// Create the container
+	resp, err := d.client.ContainerCreate(ctx, containerConfig, hostConfig, nil, nil, config.Name)
+	if err != nil {
+		// Cleanup allocated resources on failure
+		for _, port := range assignedPorts {
+			d.portInUse[port] = false
+		}
+		d.cleanupVolumes(volumePaths)
+		return "", fmt.Errorf("failed to create container: %w", err)
+	}
+
+	// Store assigned resources
+	d.assignedPorts[resp.ID] = assignedPorts
+	d.assignedVolumes[resp.ID] = volumePaths
+
+	return resp.ID, nil
 }
 
 // GetStats collects statistics for all containers

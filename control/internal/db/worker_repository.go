@@ -14,7 +14,7 @@ type WorkerRepository interface {
 	CreateWorker(worker *models.Worker) error
 	GetWorkerByToken(token string) (*models.Worker, error)
 	GetWorkerByID(id string) (*models.Worker, error)
-	UpdateWorkerMetadata(id, hostname, ipAddress string, cpuCores, ramMB int) error
+	UpdateWorkerMetadata(id, hostname, ipAddress string, cpuCores float64, ramMB int64) error
 	GetAllWorkers() ([]*models.Worker, error)
 }
 
@@ -75,7 +75,7 @@ func (r *workerRepository) GetWorkerByID(id string) (*models.Worker, error) {
 }
 
 // UpdateWorkerMetadata updates worker's system specifications
-func (r *workerRepository) UpdateWorkerMetadata(id, hostname, ipAddress string, cpuCores, ramMB int) error {
+func (r *workerRepository) UpdateWorkerMetadata(id, hostname, ipAddress string, cpuCores float64, ramMB int64) error {
 	query := `
 		UPDATE workers
 		SET hostname = ?, ip_address = ?, cpu_cores = ?, ram_mb = ?, updated_at = ?

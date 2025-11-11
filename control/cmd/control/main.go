@@ -8,13 +8,14 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
-	"github.com/mooncorn/dockyard/control/internal/auth"
 	"github.com/mooncorn/dockyard/control/internal/db"
 	"github.com/mooncorn/dockyard/control/internal/handlers"
-	"github.com/mooncorn/dockyard/control/internal/registry"
+	"github.com/mooncorn/dockyard/control/internal/job"
 	"github.com/mooncorn/dockyard/control/internal/server"
 	"github.com/mooncorn/dockyard/control/internal/services"
+	"github.com/mooncorn/dockyard/control/internal/worker"
 	"github.com/mooncorn/dockyard/proto/pb"
 	"google.golang.org/grpc"
 )
@@ -56,23 +57,45 @@ func main() {
 	store := db.NewStore(database)
 	log.Printf("Database initialized successfully")
 
-	// Create database authenticator
-	authenticator := auth.NewDBAuthenticator(store.WorkerRepo)
+	connectionStore := worker.NewConnectionStore()
 
-	// Create worker registry
-	workerRegistry := registry.NewWorkerRegistry()
+	pinger := worker.NewPinger(worker.PingerConfig{
+		ConnectionStore: connectionStore,
+		Interval:        30 * time.Second,
+	})
 
-	// Register example observer
-	observer := &LoggingObserver{}
+	pinger.Start()
+
+	// Create worker manager
+	workerRegistry := worker.NewRegistry(worker.RegistryConfig{
+		ConnectionStore: connectionStore,
+	})
 
 	// Create worker service with dependencies
 	workerService := services.NewWorkerService(services.WorkerServiceConfig{
 		WorkerRegistry: workerRegistry,
 		WorkerRepo:     store.WorkerRepo,
+		Pinger:         pinger,
 	})
 
-	statusNotifier := workerService.GetStatusNotifier()
-	statusNotifier.Subscribe(observer)
+	// Create job service
+	jobService := services.NewJobService(store.JobRepo)
+
+	// Create container service
+	containerService := services.NewContainerService(services.ContainerServiceConfig{
+		ConnectionStore: connectionStore,
+		WorkerRepo:      store.WorkerRepo,
+		JobRepo:         store.JobRepo,
+	})
+
+	// Create and start scheduler
+	scheduler := job.NewScheduler(job.SchedulerConfig{
+		JobRepo:         store.JobRepo,
+		ConnectionStore: connectionStore,
+		PollInterval:    3 * time.Second,
+	})
+
+	go scheduler.Start()
 
 	// Create gRPC listener
 	grpcAddress := fmt.Sprintf("%s:%s", *host, *grpcPort)
@@ -86,8 +109,8 @@ func main() {
 
 	// Create and register Dockyard service
 	dockyardServer := server.NewGRPCServer(server.GRPCServerConfig{
-		Authenticator: authenticator,
 		WorkerService: workerService,
+		JobService:    jobService,
 	})
 
 	pb.RegisterDockyardServiceServer(grpcServer, dockyardServer)
@@ -101,10 +124,12 @@ func main() {
 	}()
 
 	// Create HTTP server
-	tokenHandler := handlers.NewTokenHandler(workerService)
+	workerHandler := handlers.NewWorkerHandler(workerService)
+	containerHandler := handlers.NewContainerHandler(*containerService)
 	httpServer := server.NewHTTPServer(server.HTTPServerConfig{
-		TokenHandler: tokenHandler,
-		Port:         parsePort(*httpPort),
+		WorkerHandler:    workerHandler,
+		ContainerHandler: containerHandler,
+		Port:             parsePort(*httpPort),
 	})
 
 	// Start HTTP server in goroutine
@@ -121,13 +146,16 @@ func main() {
 	<-sigChan
 	log.Printf("Received shutdown signal, stopping servers...")
 
+	// Stop scheduler
+	scheduler.Stop()
+
+	// Stop pinger
+	pinger.Stop()
+
 	// Shutdown HTTP server
 	if err := httpServer.Shutdown(); err != nil {
 		log.Printf("Error shutting down HTTP server: %v", err)
 	}
-
-	// Shutdown worker registry (stops ping loops and closes connections)
-	workerRegistry.Shutdown()
 
 	// Stop gRPC server
 	grpcServer.GracefulStop()
@@ -143,12 +171,4 @@ func parsePort(port string) int {
 		p = 8081 // Default HTTP port
 	}
 	return p
-}
-
-// LoggingObserver is an example observer that logs worker status changes
-type LoggingObserver struct{}
-
-func (o *LoggingObserver) OnEvent(event registry.StatusChangedEvent) {
-	log.Printf("🔄 Worker Status Change: %s (%s -> %s)",
-		event.WorkerID, event.PreviousStatus, event.CurrentStatus)
 }

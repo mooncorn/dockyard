@@ -3,57 +3,54 @@ package server
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 
-	"github.com/mooncorn/dockyard/control/internal/auth"
 	"github.com/mooncorn/dockyard/control/internal/services"
 	"github.com/mooncorn/dockyard/proto/pb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 type GRPCServer struct {
 	pb.UnimplementedDockyardServiceServer
-	authenticator auth.Authenticator
-	workerService services.WorkerService
+	workerService *services.WorkerService
+	jobService    *services.JobService
 }
 
 type GRPCServerConfig struct {
-	Authenticator auth.Authenticator
-	WorkerService services.WorkerService
+	WorkerService *services.WorkerService
+	JobService    *services.JobService
 }
 
 func NewGRPCServer(config GRPCServerConfig) *GRPCServer {
 	return &GRPCServer{
-		authenticator: config.Authenticator,
 		workerService: config.WorkerService,
+		jobService:    config.JobService,
 	}
 }
 
 func (g *GRPCServer) StreamCommunication(stream pb.DockyardService_StreamCommunicationServer) error {
-	// Authenticate worker from stream context
-	workerID, err := g.authenticator.Authenticate(stream.Context())
-	if err != nil {
-		return fmt.Errorf("authentication failed")
+	// Extract token from stream context
+	md, ok := metadata.FromIncomingContext(stream.Context())
+	if !ok {
+		return status.Error(codes.Unauthenticated, "missing metadata")
 	}
 
-	// Check if worker is already connected
-	if g.workerService.IsWorkerOnline(workerID) {
-		log.Printf("Worker %s rejected: already connected", workerID)
-		return fmt.Errorf("worker %s is already connected", workerID)
+	workerTokens := md.Get("token")
+	if len(workerTokens) == 0 {
+		return status.Error(codes.Unauthenticated, "missing auth token")
 	}
 
-	log.Printf("Worker %s connected via communication stream", workerID)
-
-	// Register worker with the service
-	err = g.workerService.RegisterWorker(workerID, stream)
+	workerID, err := g.workerService.ConnectWorker(workerTokens[0], stream)
 	if err != nil {
-		return fmt.Errorf("failed to register worker: %w", err)
+		return status.Error(codes.Unauthenticated, "invalid credentials")
 	}
 
 	// Cleanup on disconnect
 	defer func() {
-		g.workerService.UnregisterWorker(workerID)
+		g.workerService.DisconnectWorker(workerID)
 		log.Printf("Worker %s disconnected from communication stream", workerID)
 	}()
 
@@ -87,6 +84,11 @@ func (g *GRPCServer) StreamCommunication(stream pb.DockyardService_StreamCommuni
 		switch msg := workerMsg.Message.(type) {
 		case *pb.WorkerMessage_Pong:
 			g.workerService.HandlePongReceived(workerID, msg.Pong)
+			// Check pong containers and auto-complete pending jobs
+			err := g.jobService.HandlePongReceived(workerID, msg.Pong)
+			if err != nil {
+				log.Printf("Failed to process pong for job completion (worker %s): %v", workerID, err)
+			}
 		case *pb.WorkerMessage_Metadata:
 			// Update worker metadata via service layer (includes validation)
 			err := g.workerService.HandleMetadataUpdate(workerID, msg.Metadata)
@@ -94,6 +96,12 @@ func (g *GRPCServer) StreamCommunication(stream pb.DockyardService_StreamCommuni
 				log.Printf("Failed to update worker %s metadata: %v", workerID, err)
 			} else {
 				log.Printf("Updated metadata for worker %s", workerID)
+			}
+		case *pb.WorkerMessage_JobResponse:
+			// Handle job completion/failure response from worker
+			err := g.jobService.HandleJobResponse(msg.JobResponse)
+			if err != nil {
+				log.Printf("Failed to process job response from worker %s: %v", workerID, err)
 			}
 		default:
 			log.Printf("Unknown message type received from agent %s: %T", workerID, msg)

@@ -4,14 +4,13 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"runtime"
 
 	"github.com/mooncorn/dockyard/proto/pb"
-	"github.com/shirou/gopsutil/v3/mem"
+	"github.com/mooncorn/dockyard/worker/internal/service"
 )
 
-// CollectSystemMetadata gathers worker system specifications
-func CollectSystemMetadata() (*pb.WorkerMetadata, error) {
+// CollectSystemMetadata gathers worker system specifications using the resource budget
+func CollectSystemMetadata(budget *service.ResourceBudget) (*pb.WorkerMetadata, error) {
 	// Get hostname
 	hostname, err := os.Hostname()
 	if err != nil {
@@ -21,20 +20,15 @@ func CollectSystemMetadata() (*pb.WorkerMetadata, error) {
 	// Get IP address (prefer non-loopback IPv4)
 	ipAddress := getOutboundIP()
 
-	// Get CPU cores
-	cpuCores := runtime.NumCPU()
-
-	// Get RAM in MB
-	ramMB, err := getRealRAM()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get RAM: %w", err)
-	}
+	// Get CPU and memory budget (not total system resources)
+	cpuCores := budget.GetAvailableCPU()
+	ramMB := budget.GetAvailableMemory()
 
 	return &pb.WorkerMetadata{
 		Hostname:  hostname,
 		IpAddress: ipAddress,
-		CpuCores:  int32(cpuCores),
-		RamMb:     int32(ramMB),
+		CpuCores:  float64(cpuCores),
+		RamMb:     ramMB,
 	}, nil
 }
 
@@ -59,16 +53,4 @@ func getOutboundIP() string {
 
 	localAddr := conn.LocalAddr().(*net.UDPAddr)
 	return localAddr.IP.String()
-}
-
-// getRealRAM gets the actual total system RAM in MB
-func getRealRAM() (int, error) {
-	vmStat, err := mem.VirtualMemory()
-	if err != nil {
-		return 0, fmt.Errorf("failed to get virtual memory stats: %w", err)
-	}
-
-	// Convert bytes to MB
-	ramMB := int(vmStat.Total / (1024 * 1024))
-	return ramMB, nil
 }

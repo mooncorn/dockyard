@@ -12,14 +12,16 @@ import (
 )
 
 type HTTPServer struct {
-	app          *fiber.App
-	tokenHandler *handlers.TokenHandler
-	port         int
+	app              *fiber.App
+	workerHandler    *handlers.WorkerHandler
+	containerHandler *handlers.ContainerHandler
+	port             int
 }
 
 type HTTPServerConfig struct {
-	TokenHandler *handlers.TokenHandler
-	Port         int
+	WorkerHandler    *handlers.WorkerHandler
+	ContainerHandler *handlers.ContainerHandler
+	Port             int
 }
 
 func NewHTTPServer(config HTTPServerConfig) *HTTPServer {
@@ -37,9 +39,10 @@ func NewHTTPServer(config HTTPServerConfig) *HTTPServer {
 	}))
 
 	return &HTTPServer{
-		app:          app,
-		tokenHandler: config.TokenHandler,
-		port:         config.Port,
+		app:              app,
+		workerHandler:    config.WorkerHandler,
+		containerHandler: config.ContainerHandler,
+		port:             config.Port,
 	}
 }
 
@@ -47,9 +50,13 @@ func (s *HTTPServer) RegisterRoutes() {
 	// API routes
 	api := s.app.Group("/api")
 
-	// Token management
-	tokens := api.Group("/tokens")
-	tokens.Post("/", s.tokenHandler.CreateToken)
+	// Worker management
+	worker := api.Group("/workers")
+	worker.Post("/", s.workerHandler.CreateWorker)
+
+	// Container management
+	container := api.Group("/containers")
+	container.Post("/", s.containerHandler.CreateContainer)
 
 	// Health check
 	s.app.Get("/health", func(c *fiber.Ctx) error {

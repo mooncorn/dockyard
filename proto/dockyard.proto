@@ -31,8 +31,8 @@ message WorkerMessage {
 message WorkerMetadata {
   string hostname = 1;
   string ip_address = 2;
-  int32 cpu_cores = 3;
-  int32 ram_mb = 4;
+  double cpu_cores = 3;
+  int64 ram_mb = 4;
 }
 
 // Ping/Pong messages for heartbeat
