@@ -8,9 +8,10 @@ import (
 
 // Job statuses
 const (
-	JobStatusPending   = "pending"
-	JobStatusCompleted = "completed"
-	JobStatusFailed    = "failed"
+	JobStatusPending    = "pending"
+	JobStatusDispatched = "dispatched" // Job has been sent to worker but not yet completed
+	JobStatusCompleted  = "completed"
+	JobStatusFailed     = "failed"
 )
 
 // Job types

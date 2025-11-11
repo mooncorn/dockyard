@@ -36,9 +36,9 @@ func (s *JobService) HandleJobResponse(jobResponse *pb.JobResponse) error {
 		return fmt.Errorf("failed to retrieve job %s: %w", jobID, err)
 	}
 
-	// Validate job is in pending status
-	if job.Status != models.JobStatusPending {
-		log.Printf("Warning: received response for job %s with status %s (expected pending)", jobID, job.Status)
+	// Validate job is in dispatched status (jobs are marked dispatched when sent to worker)
+	if job.Status != models.JobStatusDispatched {
+		log.Printf("[JobService] Warning: received response for job %s with status %s (expected dispatched). Job may have been already processed.", jobID, job.Status)
 		// Don't return error - response was already processed
 		return nil
 	}
@@ -56,7 +56,7 @@ func (s *JobService) HandleJobResponse(jobResponse *pb.JobResponse) error {
 			return fmt.Errorf("failed to mark job %s as completed: %w", jobID, err)
 		}
 
-		log.Printf("Job %s completed successfully with result: %s", jobID, result)
+		log.Printf("[JobService] Job %s completed successfully with result: %s", jobID, result)
 	} else {
 		// Job failed
 		errorMsg := jobResponse.ErrorMessage
@@ -69,7 +69,7 @@ func (s *JobService) HandleJobResponse(jobResponse *pb.JobResponse) error {
 			return fmt.Errorf("failed to mark job %s as failed: %w", jobID, err)
 		}
 
-		log.Printf("Job %s failed with error: %s", jobID, errorMsg)
+		log.Printf("[JobService] Job %s failed with error: %s", jobID, errorMsg)
 	}
 
 	return nil
@@ -82,20 +82,29 @@ func (s *JobService) HandlePongReceived(workerID string, pong *pb.Pong) error {
 		return fmt.Errorf("pong message is nil")
 	}
 
-	// Get all pending jobs for this worker
+	// Get all pending and dispatched jobs for this worker
+	// We check both statuses to handle edge cases where job hasn't been marked dispatched yet
 	pendingJobs, err := s.jobRepo.GetPendingJobsByWorkerID(workerID)
 	if err != nil {
 		return fmt.Errorf("failed to get pending jobs for worker %s: %w", workerID, err)
 	}
 
-	// If no pending jobs, nothing to check
-	if len(pendingJobs) == 0 {
+	dispatchedJobs, err := s.jobRepo.GetDispatchedJobsByWorkerID(workerID)
+	if err != nil {
+		return fmt.Errorf("failed to get dispatched jobs for worker %s: %w", workerID, err)
+	}
+
+	// Combine both lists
+	allJobs := append(pendingJobs, dispatchedJobs...)
+
+	// If no jobs, nothing to check
+	if len(allJobs) == 0 {
 		return nil
 	}
 
-	// Create a map of pending jobs by ID for fast lookup
+	// Create a map of jobs by ID for fast lookup
 	pendingJobsMap := make(map[string]*models.Job)
-	for _, job := range pendingJobs {
+	for _, job := range allJobs {
 		pendingJobsMap[job.ID] = job
 	}
 
@@ -121,11 +130,13 @@ func (s *JobService) HandlePongReceived(workerID string, pong *pb.Pong) error {
 		containerID := container.ContainerId
 		err = s.jobRepo.UpdateJobCompleted(jobID, containerID)
 		if err != nil {
-			log.Printf("Failed to auto-complete job %s from pong (container %s): %v", jobID, containerID, err)
+			// If job wasn't in dispatched state, it was likely already completed via explicit response
+			// This is expected behavior, just log and continue
+			log.Printf("[JobService] Auto-complete for job %s skipped (container %s): %v", jobID, containerID, err)
 			continue
 		}
 
-		log.Printf("Auto-completed job %s from pong message (container %s, state: %s)", jobID, containerID, container.State)
+		log.Printf("[JobService] Auto-completed job %s from pong message (container %s, state: %s)", jobID, containerID, container.State)
 
 		// Remove from map so we don't try to complete it again in this pong
 		delete(pendingJobsMap, jobID)

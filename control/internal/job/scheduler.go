@@ -78,7 +78,7 @@ func (s *Scheduler) processPendingJobs() {
 	// Get all pending jobs
 	jobs, err := s.jobRepo.GetPendingJobs()
 	if err != nil {
-		log.Printf("Failed to get pending jobs: %v", err)
+		log.Printf("[Scheduler] Failed to get pending jobs: %v", err)
 		return
 	}
 
@@ -86,16 +86,22 @@ func (s *Scheduler) processPendingJobs() {
 		return
 	}
 
-	log.Printf("Processing %d pending jobs", len(jobs))
+	log.Printf("[Scheduler] Processing %d pending jobs", len(jobs))
+
+	successCount := 0
+	failCount := 0
 
 	for _, job := range jobs {
 		if err := s.sendJobToWorker(job); err != nil {
-			log.Printf("Failed to send job %s to worker %s: %v", job.ID, job.WorkerID, err)
+			log.Printf("[Scheduler] Failed to send job %s to worker %s: %v", job.ID, job.WorkerID, err)
+			failCount++
 			// Continue processing other jobs
 		} else {
-			log.Printf("Successfully sent job %s to worker %s", job.ID, job.WorkerID)
+			successCount++
 		}
 	}
+
+	log.Printf("[Scheduler] Job dispatch complete: %d succeeded, %d failed", successCount, failCount)
 }
 
 // sendJobToWorker sends a job to its assigned worker
@@ -103,10 +109,12 @@ func (s *Scheduler) sendJobToWorker(job *models.Job) error {
 	// Check if worker is online
 	connection, exists := s.connectionStore.Get(job.WorkerID)
 	if !exists {
+		log.Printf("[Scheduler] Worker %s is not online, job %s will remain pending", job.WorkerID, job.ID)
 		return fmt.Errorf("worker %s is not online", job.WorkerID)
 	}
 
 	if connection.Status != worker.StatusOnline {
+		log.Printf("[Scheduler] Worker %s has status %v, job %s will remain pending", job.WorkerID, connection.Status, job.ID)
 		return fmt.Errorf("worker %s is not online (status: %v)", job.WorkerID, connection.Status)
 	}
 
@@ -142,7 +150,19 @@ func (s *Scheduler) sendJobToWorker(job *models.Job) error {
 
 	// Send message to worker
 	if err := s.connectionStore.Send(job.WorkerID, controlMessage); err != nil {
+		if err == worker.ErrChannelFull {
+			log.Printf("[Scheduler] Worker %s channel is full, job %s will be retried next poll", job.WorkerID, job.ID)
+		}
 		return fmt.Errorf("failed to send message to worker: %w", err)
+	}
+
+	// Update job status to dispatched now that it's been sent to worker
+	// This prevents the job from being counted in "reserved resources" twice
+	if err := s.jobRepo.UpdateJobStatus(job.ID, models.JobStatusDispatched); err != nil {
+		log.Printf("Warning: Failed to update job %s to dispatched status: %v", job.ID, err)
+		// Don't return error - job was successfully sent, status update is secondary
+	} else {
+		log.Printf("[Scheduler] Job %s marked as dispatched to worker %s", job.ID, job.WorkerID)
 	}
 
 	return nil

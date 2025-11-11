@@ -126,6 +126,21 @@ func (s *ConnectionStore) Send(workerID string, msg *pb.ControlMessage) error {
 	}
 }
 
+// GetChannelUtilization returns the current send channel utilization for a worker
+// Returns the number of messages in the channel and the total capacity
+// Returns ErrWorkerNotFound if the worker is not in the store
+func (s *ConnectionStore) GetChannelUtilization(workerID string) (used int, capacity int, err error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	conn, exists := s.connections[workerID]
+	if !exists {
+		return 0, 0, ErrWorkerNotFound
+	}
+
+	return len(conn.sendCh), cap(conn.sendCh), nil
+}
+
 // startSender runs in a goroutine and sends messages from the channel to the stream
 func (conn *Connection) startSender(ctx context.Context) {
 	for {

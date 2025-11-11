@@ -2,6 +2,8 @@ package services
 
 import (
 	"fmt"
+	"log"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,6 +19,7 @@ type ContainerServiceConfig struct {
 }
 
 type ContainerService struct {
+	selectionMu     sync.Mutex // Protects worker selection and job creation from race conditions
 	connectionStore *worker.ConnectionStore
 	workerRepo      db.WorkerRepository
 	jobRepo         db.JobRepository
@@ -56,11 +59,19 @@ func (c *ContainerService) CreateContainer(req *models.CreateContainerRequest) (
 		}
 	}
 
+	// Lock to prevent concurrent worker selection and job creation race conditions
+	// This ensures the read (resource check) and write (job creation) are atomic
+	c.selectionMu.Lock()
+	defer c.selectionMu.Unlock()
+
 	// Select worker with sufficient resources
 	workerID, err := c.selectWorker(req.CPUCores, req.MemoryMB)
 	if err != nil {
 		return "", fmt.Errorf("failed to select worker: %w", err)
 	}
+
+	log.Printf("[ContainerService] Selected worker %s for container job (CPU: %.2f, Memory: %d MB)",
+		workerID, req.CPUCores, req.MemoryMB)
 
 	// Create job record
 	job := &models.Job{
@@ -118,6 +129,20 @@ func (c *ContainerService) selectWorker(cpu float64, memory int64) (string, erro
 			continue // Skip if worker not in database
 		}
 
+		// Check channel capacity for backpressure - skip workers with overloaded queues
+		channelUsed, channelCapacity, err := c.connectionStore.GetChannelUtilization(workerID)
+		if err != nil {
+			log.Printf("[ContainerService] Failed to get channel utilization for worker %s: %v", workerID, err)
+			continue
+		}
+		// Skip workers with >90% channel utilization to prevent channel overflow
+		utilizationPercent := float64(channelUsed) / float64(channelCapacity) * 100
+		if utilizationPercent > 90 {
+			log.Printf("[ContainerService] Skipping worker %s due to high channel utilization: %.1f%% (%d/%d)",
+				workerID, utilizationPercent, channelUsed, channelCapacity)
+			continue
+		}
+
 		// Get resource budget from database
 		budgetCPU := worker.CPUCores
 		budgetMemory := worker.RAMMB
@@ -130,6 +155,7 @@ func (c *ContainerService) selectWorker(cpu float64, memory int64) (string, erro
 		reservedCPU, reservedMemory, err := c.jobRepo.GetReservedResources(workerID)
 		if err != nil {
 			// Log error but continue - don't fail the entire selection
+			log.Printf("[ContainerService] Failed to get reserved resources for worker %s: %v", workerID, err)
 			continue
 		}
 
@@ -143,13 +169,19 @@ func (c *ContainerService) selectWorker(cpu float64, memory int64) (string, erro
 			if bestWorkerID == "" || availableCPU > maxAvailableCPU {
 				bestWorkerID = workerID
 				maxAvailableCPU = availableCPU
+				log.Printf("[ContainerService] Candidate worker %s: CPU available=%.2f, Memory available=%d MB, Channel=%d/%d",
+					workerID, availableCPU, availableMemory, channelUsed, channelCapacity)
 			}
 		}
 	}
 
 	if bestWorkerID == "" {
+		log.Printf("[ContainerService] No suitable worker found for request (CPU: %.2f, Memory: %d MB). "+
+			"Checked %d online workers. All workers either lack resources, have high channel utilization, or are offline.",
+			cpu, memory, len(onlineConnections))
 		return "", fmt.Errorf("no suitable worker found with sufficient resources")
 	}
 
+	log.Printf("[ContainerService] Final worker selection: %s (Max available CPU: %.2f)", bestWorkerID, maxAvailableCPU)
 	return bestWorkerID, nil
 }

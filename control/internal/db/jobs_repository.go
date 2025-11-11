@@ -15,6 +15,7 @@ type JobRepository interface {
 	GetJobByID(id string) (*models.Job, error)
 	GetPendingJobs() ([]*models.Job, error)
 	GetPendingJobsByWorkerID(workerID string) ([]*models.Job, error)
+	GetDispatchedJobsByWorkerID(workerID string) ([]*models.Job, error)
 	GetReservedResources(workerID string) (cpuCores float64, memoryMB int64, err error)
 	UpdateJobStatus(jobID, status string) error
 	UpdateJobCompleted(jobID, result string) error
@@ -88,12 +89,29 @@ func (r *jobRepository) GetPendingJobsByWorkerID(workerID string) ([]*models.Job
 	return jobs, nil
 }
 
-// GetReservedResources calculates total reserved resources for a worker
-// by summing up resource requirements from all pending jobs
-func (r *jobRepository) GetReservedResources(workerID string) (cpuCores float64, memoryMB int64, err error) {
-	jobs, err := r.GetPendingJobsByWorkerID(workerID)
+// GetDispatchedJobsByWorkerID retrieves dispatched jobs for a specific worker
+func (r *jobRepository) GetDispatchedJobsByWorkerID(workerID string) ([]*models.Job, error) {
+	var jobs []*models.Job
+	query := `SELECT * FROM jobs WHERE worker_id = ? AND status = ? ORDER BY created_at ASC`
+
+	err := r.db.Select(&jobs, query, workerID, models.JobStatusDispatched)
 	if err != nil {
-		return 0, 0, fmt.Errorf("failed to get pending jobs: %w", err)
+		return nil, fmt.Errorf("failed to get dispatched jobs for worker: %w", err)
+	}
+
+	return jobs, nil
+}
+
+// GetReservedResources calculates total reserved resources for a worker
+// by summing up resource requirements from all pending and dispatched jobs
+func (r *jobRepository) GetReservedResources(workerID string) (cpuCores float64, memoryMB int64, err error) {
+	// Query for both pending and dispatched jobs since both are reserving resources
+	var jobs []*models.Job
+	query := `SELECT * FROM jobs WHERE worker_id = ? AND (status = ? OR status = ?) ORDER BY created_at ASC`
+
+	err = r.db.Select(&jobs, query, workerID, models.JobStatusPending, models.JobStatusDispatched)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to get pending/dispatched jobs: %w", err)
 	}
 
 	var totalCPU float64
@@ -135,34 +153,56 @@ func (r *jobRepository) UpdateJobStatus(jobID, status string) error {
 }
 
 // UpdateJobCompleted updates a job as completed with result
+// Only succeeds if the job is currently in dispatched status (atomic transition)
 func (r *jobRepository) UpdateJobCompleted(jobID, result string) error {
 	query := `
 		UPDATE jobs
 		SET status = ?, result = ?, completed_at = ?, updated_at = ?
-		WHERE id = ?
+		WHERE id = ? AND status = ?
 	`
 
 	now := time.Now()
-	_, err := r.db.Exec(query, models.JobStatusCompleted, result, now, now, jobID)
+	res, err := r.db.Exec(query, models.JobStatusCompleted, result, now, now, jobID, models.JobStatusDispatched)
 	if err != nil {
 		return fmt.Errorf("failed to update job as completed: %w", err)
+	}
+
+	// Check if any rows were affected - if not, job wasn't in dispatched state
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	if rowsAffected == 0 {
+		return fmt.Errorf("job %s was not in dispatched state (may have been already completed)", jobID)
 	}
 
 	return nil
 }
 
 // UpdateJobFailed updates a job as failed with error message
+// Only succeeds if the job is currently in dispatched status (atomic transition)
 func (r *jobRepository) UpdateJobFailed(jobID, errorMsg string) error {
 	query := `
 		UPDATE jobs
 		SET status = ?, error_message = ?, completed_at = ?, updated_at = ?
-		WHERE id = ?
+		WHERE id = ? AND status = ?
 	`
 
 	now := time.Now()
-	_, err := r.db.Exec(query, models.JobStatusFailed, errorMsg, now, now, jobID)
+	res, err := r.db.Exec(query, models.JobStatusFailed, errorMsg, now, now, jobID, models.JobStatusDispatched)
 	if err != nil {
 		return fmt.Errorf("failed to update job as failed: %w", err)
+	}
+
+	// Check if any rows were affected - if not, job wasn't in dispatched state
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	if rowsAffected == 0 {
+		return fmt.Errorf("job %s was not in dispatched state (may have been already completed/failed)", jobID)
 	}
 
 	return nil
